@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # 1. Queue Service (Redis)
+  redis:
+    image: redis:6.2-alpine
+    container_name: redis_queue
+    ports:
+      - "6379:6379"
+
+  # 2. Backend Service (FastAPI)
+  backend:
+    build:
+      context: . # Set the build context to the root directory
+      dockerfile: ./backend/Dockerfile # Specify the Dockerfile path
+    container_name: api_backend
+    ports:
+      - "8000:8000"
+    # Load environment variables from the .env file in the root
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis # Keep internal network setting
+    depends_on:
+      - redis
+    volumes:
+      - ./backend:/app
+      - ./backend/models:/app/models # Ensure models directory is accessible
+
+  # 3. Worker Services (Celery)
+  worker1:
+    build:
+      context: . # Set the build context to the root directory
+      dockerfile: ./worker/Dockerfile # Specify the Dockerfile path
+    container_name: ml_worker_1
+    env_file:
+      - .env # Load environment variables from the .env file
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - backend
+    command: celery -A worker.celery_app worker --loglevel=info
+    volumes:
+      - ./backend/models:/app/models
+      - ./backend/feature_extractor.py:/app/feature_extractor.py
+      - ./worker:/app
+
+  # 4. Frontend Service (Nginx)
+  frontend:
+    build: ./frontend
+    container_name: ui_frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend

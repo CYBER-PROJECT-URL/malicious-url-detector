@@ -1,0 +1,5 @@
+.env
+/backend/models/*.pkl
+__pycache__/
+*.pyc
+venv/

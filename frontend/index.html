@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Malicious URL Detector</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>🔎 Distributed URL Scanner (ML)</h1>
+        <p>Enter a URL to be scanned by the distributed Workers:</p>
+        <input type="text" id="urlInput" placeholder="e.g., http://www.phishing-site.com" size="60">
+        <button onclick="scanUrl()">Scan URL</button>
+
+        <div id="results">
+            <h2>Scan Status & Report</h2>
+            <p id="taskStatus" class="pending">Awaiting scan submission...</p>
+            <p id="finalResult"></p>
+            <div id="graphContainer"></div> </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

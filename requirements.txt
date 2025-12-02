@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+celery
+redis
+pydantic
+scikit-learn
+pandas
+xgboost
+tldextract
