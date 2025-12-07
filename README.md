@@ -1,6 +1,5 @@
 ## 📄 README.md (קובץ נקי)
 
-````markdown
 # 🔬 Detecting Malicious URLs using Distributed Machine Learning
 
 **Course:** שיטות לזיהוי התקפות סייבר (Cyber Attack Detection Methods)
