@@ -1,4 +1,4 @@
-## 📄 README.md (קובץ נקי)
+## 📄 README.md 
 
 # 🔬 Detecting Malicious URLs using Distributed Machine Learning
 
