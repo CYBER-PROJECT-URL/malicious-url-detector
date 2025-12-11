@@ -1,4 +1,17 @@
-# worker/worker.py
+"""
+Worker Module for URL Malware Classification
+--------------------------------------------
+
+This module runs inside a Celery worker and performs:
+
+1. Load trained model assets (model, encoder, scaler, selected features)
+2. Receive URL from backend task
+3. Convert URL → model-ready feature vector (using the inference feature extractor)
+4. Apply encoder + scaler (if used during training)
+5. Return prediction + probability score
+
+This version is fully synchronized with the training pipeline.
+"""
 
 from celery import Celery
 import joblib
@@ -7,166 +20,140 @@ import numpy as np
 import os
 from datetime import datetime
 
-from backend.models.feature_extractor import extract_all_features_url
-
-# ---------- 1. קבועים ונתיבי Assets ----------
-
-# חשוב: ב-docker-compose למפות:
-# - ./models:/app/assets
-# - ./backend:/app/backend
-ASSET_PATH = os.path.join(os.getcwd(), 'assets')
-FAILURE_CODE = -1
-
-CATEGORICAL_COLS = [
-    'Server_Country_IPAPI',
-    'Server_Country_Code',
-    'WHOIS_Country',
-    'WHOIS_Registrar',
-    'Domain',
-    'IP_Type'
-]
-
-# אם שמרת גם רשימה של numeric_feature_cols באימון – אפשר לטעון מכאן.
-# כרגע נניח שכל מה שלא ב-CATEGORICAL_COLS הוא numeric.
+# IMPORTANT:
+# Use the unified inference pipeline from backend.feature_extractor
+from backend.feature_extractor import prepare_features_for_model
 
 
-# ---------- 2. טעינת נכסי המודל ----------
+# -------------------------------------------------------------
+# 1. Asset paths
+# -------------------------------------------------------------
+ASSET_PATH = os.path.join(os.getcwd(), "assets")
 
 MODEL = None
 ENCODER = None
 SCALER = None
 SELECTED_FEATURES = None
-SELECTED_NO_LABEL = None
 ASSETS_LOADED = False
 
+
+# -------------------------------------------------------------
+# 2. Load model assets
+# -------------------------------------------------------------
 try:
     MODEL = joblib.load(os.path.join(ASSET_PATH, "best_model_xgb.pkl"))
     ENCODER = joblib.load(os.path.join(ASSET_PATH, "categorical_encoder.pkl"))
     SCALER = joblib.load(os.path.join(ASSET_PATH, "feature_scaler.pkl"))
 
-    with open(os.path.join(ASSET_PATH, "selected_features.txt"), 'r') as f:
-        SELECTED_FEATURES = [line.strip() for line in f]
+    with open(os.path.join(ASSET_PATH, "selected_features.txt"), "r") as f:
+        SELECTED_FEATURES = [line.strip() for line in f.readlines() if line.strip()]
 
-    SELECTED_NO_LABEL = [f for f in SELECTED_FEATURES if f != 'Label']
-
-    print("✅ Assets נטענו בהצלחה מהתיקייה:", ASSET_PATH)
-    print("   - מודל:", type(MODEL))
-    print("   - מספר פיצ'רים נבחרים (ללא Label):", len(SELECTED_NO_LABEL))
+    print("✅ Successfully loaded model assets from:", ASSET_PATH)
     ASSETS_LOADED = True
+
 except Exception as e:
-    print(f"❌ שגיאה קריטית בטעינת Assets מתוך {ASSET_PATH}: {e}")
+    print("❌ Failed to load assets:", e)
     ASSETS_LOADED = False
 
 
-# ---------- 3. Celery app ----------
+# -------------------------------------------------------------
+# 3. Celery configuration
+# -------------------------------------------------------------
+app = Celery("tasks", broker="redis://redis:6379/0")
 
-app = Celery('tasks', broker='redis://redis:6379/0')
 
-
-# ---------- 4. עיבוד פיצ'רים + חיזוי ----------
-
-def preprocess_and_predict(feats: dict):
+# -------------------------------------------------------------
+# 4. Apply encoder and scaler (if exist)
+# -------------------------------------------------------------
+def apply_postprocessing(df: pd.DataFrame) -> pd.DataFrame:
     """
-    מקבל dict מפונקציית extract_all_features_url,
-    מבצע:
-    - השלמת פיצ'רים חסרים
-    - קידוד קטגוריאלי (OrdinalEncoder)
-    - scaling לפיצ'רים נומריים
-    - חיזוי בעזרת המודל
+    Apply categorical encoding + numerical scaling exactly as done during training.
     """
+
+    df = df.copy()
+
+    # 1. Encoder
+    if ENCODER is not None:
+        try:
+            categorical_cols = ENCODER.feature_names_in_
+            df[categorical_cols] = ENCODER.transform(df[categorical_cols])
+        except Exception as e:
+            print("⚠ Encoder error:", e)
+
+    # 2. Scaler
+    if SCALER is not None:
+        try:
+            numeric_cols = SCALER.feature_names_in_
+            df[numeric_cols] = SCALER.transform(df[numeric_cols])
+        except Exception as e:
+            print("⚠ Scaler error:", e)
+
+    return df
+
+
+# -------------------------------------------------------------
+# 5. Main prediction pipeline
+# -------------------------------------------------------------
+def predict_url(url: str):
+    """
+    Complete inference pipeline for a single URL:
+    - Extract raw training-compatible features
+    - Align with training columns
+    - Apply encoder + scaler
+    - Predict using XGBoost model
+    """
+
     if not ASSETS_LOADED:
         return 0, 0.0
 
-    # הופך לשורה אחת של DataFrame
-    df = pd.DataFrame([feats])
+    # 1. Extract model-ready features
+    df = prepare_features_for_model(url)
 
-    # עמודות שלא נדרשות למודל (Label ו-IP)
-    df = df.drop(columns=['Resolved_IP', 'url_original', 'Label'], errors='ignore')
+    # 2. Apply encoder + scaler
+    df = apply_postprocessing(df)
 
-    # 1. לוודא שכל הפיצ'רים מהאימון קיימים
-    #    פיצ'רים שנחסרו – יקבלו FAILURE_CODE (יוחלף אח"כ).
-    for col in SELECTED_NO_LABEL:
-        if col not in df.columns:
-            df[col] = FAILURE_CODE
-
-    # 2. זיהוי/הוספת עמודות קטגוריאליות חסרות
-    for c in CATEGORICAL_COLS:
-        if c not in df.columns:
-            df[c] = "Unknown"
-
-    # 3. קידוד קטגוריאלי (OrdinalEncoder עם handle_unknown='use_encoded_value', unknown_value=-1 באימון)
-    cols_present = [c for c in CATEGORICAL_COLS if c in df.columns]
-    if cols_present and ENCODER is not None:
-        try:
-            df[cols_present] = ENCODER.transform(df[cols_present])
-        except Exception as e:
-            print(f"⚠ שגיאה ב-ENCODER.transform: {e}")
-            # במקרה כשל, ננסה להחליף בערכי unknown
-            for c in cols_present:
-                df[c] = -1
-
-    # 4. החלפה ראשונית של FAILURE_CODE לערך 0 (הסקיילר אומן אחרי טיפול ב-Failure באימון)
-    df.replace(FAILURE_CODE, 0, inplace=True)
-    df.fillna(0, inplace=True)
-
-    # 5. בחירת סדר הפיצ'רים לפי selected_features.txt
-    #    המודל אומן על סדר זה, ולכן חייבים אותו כאן.
-    X = df[SELECTED_NO_LABEL]
-
-    # 6. זיהוי פיצ'רים נומריים – כאן נזהר שלא לשנות את העמודות הקטגוריאליות לאחר הקידוד
-    numeric_feature_cols = [c for c in X.columns if c not in CATEGORICAL_COLS]
-
-    # 7. Scaling לפיצ'רים נומריים בלבד
-    if numeric_feature_cols and SCALER is not None:
-        try:
-            X[numeric_feature_cols] = SCALER.transform(X[numeric_feature_cols])
-        except Exception as e:
-            print(f"⚠ שגיאה ב-SCALER.transform: {e}")
-
-    # 8. חיזוי
+    # 3. Run model prediction
     try:
-        prediction = MODEL.predict(X)[0]
-        if hasattr(MODEL, "predict_proba"):
-            score = MODEL.predict_proba(X)[:, 1][0]
-        else:
-            score = float(prediction)
+        y_pred = MODEL.predict(df)[0]
+        y_score = float(MODEL.predict_proba(df)[:, 1][0])
     except Exception as e:
-        print(f"❌ שגיאה בחיזוי המודל: {e}")
+        print("❌ Model prediction error:", e)
         return 0, 0.0
 
-    return prediction, score
+    return int(y_pred), float(y_score)
 
 
-# ---------- 5. משימת Celery ----------
-
-@app.task(name='analyze_url_for_malware')
+# -------------------------------------------------------------
+# 6. Celery task that backend will call
+# -------------------------------------------------------------
+@app.task(name="analyze_url_for_malware")
 def analyze_url_for_malware(url: str):
     """
-    משימת Celery המקבלת URL ומחזירה ניבוי.
-    1. חילוץ פיצ'רים (extract_all_features_url)
-    2. עיבוד (encoder + scaler)
-    3. חיזוי
+    Public Celery task used by the backend API.
+    Returns:
+      - URL
+      - Prediction
+      - Probability score
+      - Status
+      - Timestamp
     """
+
     if not ASSETS_LOADED:
         return {
             "url": url,
             "is_malicious": False,
             "score": 0.0,
-            "status": "error",
             "error": "Model assets not loaded",
+            "status": "error",
             "timestamp": datetime.now().isoformat()
         }
 
-    # 1. חילוץ פיצ'רים – בדיוק כמו באימון
-    feats = extract_all_features_url(url, label=None)
-
-    # 2. עיבוד וחיזוי
-    prediction, score = preprocess_and_predict(feats)
+    prediction, score = predict_url(url)
 
     return {
         "url": url,
         "is_malicious": bool(prediction),
-        "score": float(score),
+        "score": score,
         "status": "completed",
         "timestamp": datetime.now().isoformat()
     }
