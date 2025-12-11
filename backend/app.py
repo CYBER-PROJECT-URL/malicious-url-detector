@@ -1,67 +1,136 @@
-# backend/app.py
+"""
+Backend API for the Malicious URL Detection System
+---------------------------------------------------
+
+This service exposes two endpoints:
+
+1. POST /api/v1/scan
+   - Receives a URL from the client
+   - Sends an asynchronous Celery task to the worker
+   - Returns a task_id
+
+2. GET /api/v1/status/{task_id}
+   - Fetches the task status and result from Celery
+   - Returns prediction results once completed
+
+This file must stay fully synchronized with:
+- worker.py (task name + communication format)
+- frontend/script.js (response JSON structure)
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any
-import os
 from celery import Celery
+import os
 
-# Configuration for Celery (using Redis as the broker/backend)
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-celery_app = Celery('tasks', broker=f'redis://{REDIS_HOST}:6379/0', backend=f'redis://{REDIS_HOST}:6379/0')
-# Note: The backend is used to store and retrieve task results
+# -------------------------------------------------------------
+# Celery Configuration
+# -------------------------------------------------------------
+# IMPORTANT:
+# Inside Docker, Redis is NOT "localhost", it is the service name: "redis"
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis')
 
+celery_app = Celery(
+    'tasks',
+    broker=f'redis://{REDIS_HOST}:6379/0',
+    backend=f'redis://{REDIS_HOST}:6379/0'
+)
+
+# -------------------------------------------------------------
+# FastAPI App
+# -------------------------------------------------------------
 app = FastAPI(
     title="Malicious URL Detector API",
-    description="API for real-time URL classification using a lightweight, distributed ML model.",
+    description="Asynchronous API for real-time URL classification using ML models.",
     version="1.0.0"
-)  # Ensures full OpenAPI documentation
+)
 
 
+# -------------------------------------------------------------
+# Request Model
+# -------------------------------------------------------------
 class URLRequest(BaseModel):
     url: str
 
 
-@app.post("/api/v1/scan", response_model=Dict[str, Any], summary="Scan a URL for Malicious Content")
+# -------------------------------------------------------------
+# Helper: sanitize URL
+# -------------------------------------------------------------
+def normalize_url(url: str) -> str:
+    """
+    Normalize URL format (same logic as inference pipeline).
+    Ensures consistency between backend and worker.
+    """
+    url = url.strip()
+    if "://" not in url:
+        url = "http://" + url
+    return url.lower()
+
+
+# -------------------------------------------------------------
+# API Endpoint: Submit URL for analysis
+# -------------------------------------------------------------
+@app.post("/api/v1/scan", response_model=Dict[str, Any], summary="Scan a URL for malicious behavior")
 async def scan_url(request: URLRequest):
     """
-    Receives a URL and submits an asynchronous task to the Celery Workers for processing.
+    Accepts a URL string and sends an asynchronous Celery task.
+    Returns a task_id that the client can later query.
     """
+
     if not request.url:
         raise HTTPException(status_code=400, detail="URL must be provided")
 
-    # Send the task to the queue (the 'worker' service will pick it up)
-    # The task name must match the one defined in worker/worker.py
-    task = celery_app.send_task('worker.task_process_url', args=[request.url])
+    clean_url = normalize_url(request.url)
+
+    # TASK NAME MUST MATCH worker.py EXACTLY
+    task = celery_app.send_task("analyze_url_for_malware", args=[clean_url])
 
     return {
         "status": "Processing",
         "task_id": task.id,
-        "message": "URL submitted for analysis. Check the status endpoint for the result."
+        "submitted_url": clean_url,
+        "message": "URL submitted successfully. Use /status/{task_id} to check results."
     }
 
 
-@app.get("/api/v1/status/{task_id}", response_model=Dict[str, Any], summary="Get Scan Status and Result")
+# -------------------------------------------------------------
+# API Endpoint: Check task result
+# -------------------------------------------------------------
+@app.get("/api/v1/status/{task_id}", response_model=Dict[str, Any], summary="Retrieve scan result")
 async def get_scan_status(task_id: str):
     """
-    Checks the status of a submitted task and returns the final prediction if completed.
+    Checks the status of the Celery task.
+    If completed, returns the prediction & score from worker.py.
     """
+
     task = celery_app.AsyncResult(task_id)
 
-    if task.state == 'PENDING':
-        response = {"status": "Pending", "message": "Task is waiting in the queue."}
-    elif task.state == 'FAILURE':
-        response = {"status": "Failed", "result": str(task.result),
-                    "message": "Processing failed due to an internal error."}
-    elif task.state != 'SUCCESS':
-        # States like STARTED, RETRY, etc.
-        response = {"status": task.state, "message": f"Task is currently in state: {task.state}"}
-    else:
-        # Task is successful, return the prediction result
-        response = {
-            "status": "Completed",
-            "result": task.result,
-            "message": "Analysis completed."
+    if task.state == "PENDING":
+        return {
+            "status": "Pending",
+            "message": "Task is waiting in the queue."
         }
-    return response
 
-# Note: The automatically generated OpenAPI documentation is available at /docs
+    if task.state == "FAILURE":
+        return {
+            "status": "Failed",
+            "error": str(task.result),
+            "message": "Task failed due to an internal error."
+        }
+
+    if task.state != "SUCCESS":
+        return {
+            "status": task.state,
+            "message": f"Task currently in state: {task.state}"
+        }
+
+    # SUCCESS → return worker results
+    return {
+        "status": "Completed",
+        "result": task.result,
+        "message": "URL analysis finished successfully."
+    }
+
+
+# API documentation available at /docs
