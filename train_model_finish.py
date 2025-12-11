@@ -442,7 +442,7 @@ def build_enriched_dataset_parallel(raw_data_path, max_workers=None):
         return None
 
     if max_workers is None:
-        max_workers = min(16, (multiprocessing.cpu_count() or 4) * 2)
+        max_workers = min(32, (multiprocessing.cpu_count() or 4) * 2)
 
     rows = []
     print(f"🚀 מתחיל pipeline מקבילי על כל ה-URLs... (max_workers={max_workers})")
